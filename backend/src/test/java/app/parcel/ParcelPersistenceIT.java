@@ -3,8 +3,10 @@ package app.parcel;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import app.AbstractIntegrationTest;
-import app.user.UserAccount;
-import app.user.UserRepository;
+import app.parcel.domain.Parcel;
+import app.parcel.repository.ParcelRepository;
+import app.user.domain.UserAccount;
+import app.user.repository.UserRepository;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
