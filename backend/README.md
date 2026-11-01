@@ -11,8 +11,10 @@ Base package `app`, organized by feature:
 ```
 src/main/java/app/
   Application.java
-  common/     config, security, OpenAPI, exception handling
-  user/       controller, service, repository, entity, dto
+  common/     cross-feature code
+    config/     OpenAPI and security configuration
+    error/      Problem Details, exception handling, endpoint stubs
+  user/       users and authentication
   crop/       the crop list served from the AI service
   parcel/     CRUD parcels, PostGIS geometries
   diagnosis/  image upload, results
@@ -24,6 +26,11 @@ src/main/resources/
   db/migration/            Flyway migrations
 src/test/java/app/         same packages as main
 ```
+
+Each feature package is grouped by layer: `web/` (controllers), `dto/`
+(request/response records and their enums), `domain/` (JPA entities),
+`repository/` (Spring Data repositories) and `mapper/` (MapStruct mappers).
+A feature only has the sub-packages it needs.
 
 Unit tests are `*Test.java` (surefire). Integration tests are `*IT.java` (failsafe) and extend `AbstractIntegrationTest`, which starts PostGIS and RabbitMQ once.
 
