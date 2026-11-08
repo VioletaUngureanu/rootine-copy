@@ -1,0 +1,212 @@
+diff --git a/backend/src/main/java/app/aiclient/AiServiceExceptionHandler.java b/backend/src/main/java/app/aiclient/AiServiceExceptionHandler.java
+index 4fb4d90..c124641 100644
+--- a/backend/src/main/java/app/aiclient/AiServiceExceptionHandler.java
++++ b/backend/src/main/java/app/aiclient/AiServiceExceptionHandler.java
+@@ -1,5 +1,7 @@
+ package app.aiclient;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ProblemDetail;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+@@ -8,9 +10,20 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
+ @RestControllerAdvice
+ public class AiServiceExceptionHandler {
+ 
++  private static final Logger LOGGER = LoggerFactory.getLogger(AiServiceExceptionHandler.class);
++
++  /**
++   * Reports any AI-service failure as an RFC 9457 Problem Details with status 502, matching the
++   * status codes in {@code docs/api/backend.md}. The cause is logged (without any request payload)
++   * so operators can see why the AI call failed.
++   */
+   @ExceptionHandler(AiServiceException.class)
+   ProblemDetail handleAiServiceException(AiServiceException exception) {
+-    return ProblemDetail.forStatusAndDetail(
+-        HttpStatus.BAD_GATEWAY, "The AI service request failed");
++    LOGGER.warn("AI service request failed: {}", exception.getMessage(), exception);
++    ProblemDetail problemDetail =
++        ProblemDetail.forStatusAndDetail(
++            HttpStatus.BAD_GATEWAY, "The AI service is unavailable or returned an error.");
++    problemDetail.setTitle("Bad Gateway");
++    return problemDetail;
+   }
+ }
+diff --git a/backend/src/main/java/app/diagnosis/service/DiagnosisService.java b/backend/src/main/java/app/diagnosis/service/DiagnosisService.java
+index 88e3bd9..d76d2a0 100644
+--- a/backend/src/main/java/app/diagnosis/service/DiagnosisService.java
++++ b/backend/src/main/java/app/diagnosis/service/DiagnosisService.java
+@@ -157,11 +157,16 @@ public class DiagnosisService {
+     return true;
+   }
+ 
++  /**
++   * Maps an AI prediction into the stored result. A {@code null} crop, a {@code not_supported}
++   * support level and the {@code crop_not_supported}/{@code invalid_image} statuses are valid
++   * results per the API contract, not errors, so they are mapped through with an empty prediction
++   * list. Only a genuinely incomplete or unparseable response becomes an {@link AiServiceException}
++   * (which the handler reports as 502).
++   */
+   private static DiagnosisResult toDiagnosisResult(PredictionResponse prediction) {
+     if (prediction == null
+-        || prediction.crop() == null
+         || prediction.status() == null
+-        || prediction.topPredictions() == null
+         || prediction.supportLevel() == null
+         || prediction.modelVersion() == null) {
+       throw new AiServiceException("AI service returned an incomplete prediction.");
+@@ -174,9 +179,11 @@ public class DiagnosisService {
+               : parseEnum(CropCheck.class, prediction.cropCheck());
+       SupportLevel supportLevel = parseEnum(SupportLevel.class, prediction.supportLevel());
+       List<Prediction> topPredictions =
+-          prediction.topPredictions().stream()
+-              .map(item -> new Prediction(item.label(), item.disease(), item.probability()))
+-              .toList();
++          prediction.topPredictions() == null
++              ? List.of()
++              : prediction.topPredictions().stream()
++                  .map(item -> new Prediction(item.label(), item.disease(), item.probability()))
++                  .toList();
+       return new DiagnosisResult(
+           status, prediction.crop(), cropCheck, topPredictions, supportLevel);
+     } catch (IllegalArgumentException exception) {
+diff --git a/backend/src/main/java/app/diagnosis/web/DiagnosisExceptionHandler.java b/backend/src/main/java/app/diagnosis/web/DiagnosisExceptionHandler.java
+index 45dd94a..1bbd489 100644
+--- a/backend/src/main/java/app/diagnosis/web/DiagnosisExceptionHandler.java
++++ b/backend/src/main/java/app/diagnosis/web/DiagnosisExceptionHandler.java
+@@ -46,6 +46,8 @@ public class DiagnosisExceptionHandler {
+   }
+ 
+   private static ProblemDetail problem(HttpStatus status, String detail) {
+-    return ProblemDetail.forStatusAndDetail(status, detail);
++    ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(status, detail);
++    problemDetail.setTitle(status.getReasonPhrase());
++    return problemDetail;
+   }
+ }
+diff --git a/backend/src/test/java/app/diagnosis/DiagnosisWorkflowIT.java b/backend/src/test/java/app/diagnosis/DiagnosisWorkflowIT.java
+index bb365ba..a086e81 100644
+--- a/backend/src/test/java/app/diagnosis/DiagnosisWorkflowIT.java
++++ b/backend/src/test/java/app/diagnosis/DiagnosisWorkflowIT.java
+@@ -173,6 +173,89 @@ class DiagnosisWorkflowIT extends AbstractIntegrationTest {
+     verifyNoInteractions(aiServiceClient);
+   }
+ 
++  @Test
++  void savesCropNotSupportedResultAsAValidDiagnosis() throws Exception {
++    UUID ownerId = UUID.randomUUID();
++    Parcel parcel = savedParcel(ownerId);
++    when(aiServiceClient.predict(any(), eq("potato")))
++        .thenReturn(
++            new PredictionResponse(
++                "crop_not_supported", "potato", null, List.of(), "not_supported", "plant-v1"));
++
++    var creation =
++        mockMvc
++            .perform(
++                multipart("/diagnoses")
++                    .file(jpeg())
++                    .part(parcelPart(parcel.getId()))
++                    .with(jwt().jwt(token -> token.subject(ownerId.toString()))))
++            .andExpect(status().isCreated())
++            .andExpect(jsonPath("$.status").value("crop_not_supported"))
++            .andExpect(jsonPath("$.cropCheck").doesNotExist())
++            .andExpect(jsonPath("$.supportLevel").value("not_supported"))
++            .andExpect(jsonPath("$.topPredictions").isEmpty())
++            .andReturn();
++
++    uploadedPhoto = savedPhotoPath(creation.getResponse().getContentAsString());
++  }
++
++  @Test
++  void savesResultWithNullCropAsAValidDiagnosis() throws Exception {
++    UUID ownerId = UUID.randomUUID();
++    Parcel parcel = savedParcel(ownerId);
++    when(aiServiceClient.predict(any(), eq("potato")))
++        .thenReturn(
++            new PredictionResponse(
++                "invalid_image", null, null, List.of(), "not_supported", "plant-v1"));
++
++    var creation =
++        mockMvc
++            .perform(
++                multipart("/diagnoses")
++                    .file(jpeg())
++                    .part(parcelPart(parcel.getId()))
++                    .with(jwt().jwt(token -> token.subject(ownerId.toString()))))
++            .andExpect(status().isCreated())
++            .andExpect(jsonPath("$.status").value("invalid_image"))
++            .andExpect(jsonPath("$.crop").doesNotExist())
++            .andExpect(jsonPath("$.topPredictions").isEmpty())
++            .andReturn();
++
++    uploadedPhoto = savedPhotoPath(creation.getResponse().getContentAsString());
++  }
++
++  @Test
++  void returns502WhenAiResponseIsIncomplete() throws Exception {
++    UUID ownerId = UUID.randomUUID();
++    Parcel parcel = savedParcel(ownerId);
++    when(aiServiceClient.predict(any(), eq("potato")))
++        .thenReturn(new PredictionResponse(null, "potato", "ok", List.of(), "lab_only", null));
++
++    mockMvc
++        .perform(
++            multipart("/diagnoses")
++                .file(jpeg())
++                .part(parcelPart(parcel.getId()))
++                .with(jwt().jwt(token -> token.subject(ownerId.toString()))))
++        .andExpect(status().isBadGateway())
++        .andExpect(content().contentTypeCompatibleWith(PROBLEM_JSON))
++        .andExpect(jsonPath("$.status").value(502))
++        .andExpect(jsonPath("$.title").value("Bad Gateway"));
++  }
++
++  @Test
++  void rejectsInvalidBearerTokenWithUnauthorizedNotServerError() throws Exception {
++    mockMvc
++        .perform(
++            multipart("/diagnoses")
++                .file(jpeg())
++                .part(parcelPart(UUID.randomUUID()))
++                .header("Authorization", "Bearer not.a.valid.token"))
++        .andExpect(status().isUnauthorized());
++
++    verifyNoInteractions(aiServiceClient);
++  }
++
+   @Test
+   void doesNotPersistPhotoOrDiagnosisWhenAiServiceFails() throws Exception {
+     UUID ownerId = UUID.randomUUID();
+@@ -240,6 +323,17 @@ class DiagnosisWorkflowIT extends AbstractIntegrationTest {
+         "plant-v1");
+   }
+ 
++  private Path savedPhotoPath(String creationResponseBody) throws Exception {
++    UUID diagnosisId =
++        UUID.fromString(
++            com.fasterxml.jackson.databind.json.JsonMapper.builder()
++                .build()
++                .readTree(creationResponseBody)
++                .get("id")
++                .asText());
++    return Path.of(diagnosisRepository.findById(diagnosisId).orElseThrow().getPhotoPath());
++  }
++
+   private long photoCount() throws Exception {
+     if (!Files.exists(UPLOAD_DIRECTORY)) {
+       return 0;
+diff --git a/docs/api/backend.md b/docs/api/backend.md
+index 9e3a8c6..2170b88 100644
+--- a/docs/api/backend.md
++++ b/docs/api/backend.md
+@@ -246,7 +246,7 @@ Errors:
+ | id | UUID, set by the backend |
+ | parcelId | The parcel the photo belongs to |
+ | status | `confident`, `unsure`, `invalid_image`, `crop_not_supported` |
+-| crop | The crop used |
++| crop | The crop used, or `null` when the AI service could not determine one |
+ | cropCheck | `ok`, `mismatch`, or `null` when no check was possible (`invalid_image`, `crop_not_supported`) |
+ | topPredictions | 3 items: `label` (`<crop>_<disease>`), `disease`, `probability` (0 to 1). Empty list when `status` is `invalid_image` or `crop_not_supported` |
+ | supportLevel | `lab_and_field_tested`, `lab_only`, `not_supported` |
