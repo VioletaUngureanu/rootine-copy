@@ -1,70 +1,19 @@
-diff --git a/backend/src/main/java/app/diagnosis/service/DiagnosisPersistence.java b/backend/src/main/java/app/diagnosis/service/DiagnosisPersistence.java
-new file mode 100644
-index 0000000..1c0f89c
---- /dev/null
-+++ b/backend/src/main/java/app/diagnosis/service/DiagnosisPersistence.java
-@@ -0,0 +1,47 @@
-+package app.diagnosis.service;
-+
-+import app.diagnosis.domain.Diagnosis;
-+import app.diagnosis.dto.DiagnosisResponse;
-+import app.diagnosis.mapper.DiagnosisMapper;
-+import app.diagnosis.repository.DiagnosisRepository;
-+import app.parcel.domain.Parcel;
-+import app.parcel.repository.ParcelRepository;
-+import java.util.UUID;
-+import org.springframework.stereotype.Component;
-+import org.springframework.transaction.annotation.Transactional;
-+
-+/**
-+ * Database steps of the diagnosis flow, each in its own short transaction. Kept in a separate bean
-+ * from {@link DiagnosisService} so that Spring's transaction proxy actually applies: the AI network
-+ * call in the service runs between these transactions, never inside one.
-+ */
-+@Component
-+class DiagnosisPersistence {
-+
-+  private final DiagnosisRepository diagnosisRepository;
-+  private final ParcelRepository parcelRepository;
-+  private final DiagnosisMapper diagnosisMapper;
-+
-+  DiagnosisPersistence(
-+      DiagnosisRepository diagnosisRepository,
-+      ParcelRepository parcelRepository,
-+      DiagnosisMapper diagnosisMapper) {
-+    this.diagnosisRepository = diagnosisRepository;
-+    this.parcelRepository = parcelRepository;
-+    this.diagnosisMapper = diagnosisMapper;
-+  }
-+
-+  /** Loads an owned parcel in a read-only transaction before the AI call runs. */
-+  @Transactional(readOnly = true)
-+  Parcel loadOwnedParcel(UUID parcelId, UUID ownerId) {
-+    return parcelRepository
-+        .findByIdAndOwnerId(parcelId, ownerId)
-+        .orElseThrow(() -> new DiagnosisNotFoundException("The parcel was not found."));
-+  }
-+
-+  /** Persists a finished diagnosis in its own transaction after the AI call has returned. */
-+  @Transactional
-+  DiagnosisResponse save(Diagnosis diagnosis) {
-+    return diagnosisMapper.toResponse(diagnosisRepository.save(diagnosis));
-+  }
-+}
 diff --git a/backend/src/main/java/app/diagnosis/service/DiagnosisService.java b/backend/src/main/java/app/diagnosis/service/DiagnosisService.java
-index d76d2a0..5db0bb0 100644
+index d76d2a0..5e85e9b 100644
 --- a/backend/src/main/java/app/diagnosis/service/DiagnosisService.java
 +++ b/backend/src/main/java/app/diagnosis/service/DiagnosisService.java
-@@ -22,6 +22,8 @@ import java.time.Instant;
+@@ -22,7 +22,10 @@ import java.time.Instant;
  import java.util.List;
  import java.util.Locale;
  import java.util.UUID;
 +import org.slf4j.Logger;
 +import org.slf4j.LoggerFactory;
  import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Lazy;
  import org.springframework.stereotype.Service;
  import org.springframework.transaction.annotation.Transactional;
-@@ -31,6 +33,7 @@ import org.springframework.web.multipart.MultipartFile;
+ import org.springframework.web.multipart.MultipartFile;
+@@ -31,6 +34,7 @@ import org.springframework.web.multipart.MultipartFile;
  @Service
  public class DiagnosisService {
  
@@ -72,25 +21,25 @@ index d76d2a0..5db0bb0 100644
    private static final long MAX_IMAGE_SIZE = 10L * 1024 * 1024;
    private static final byte[] PNG_SIGNATURE =
        new byte[] {(byte) 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
-@@ -39,6 +42,7 @@ public class DiagnosisService {
+@@ -39,6 +43,7 @@ public class DiagnosisService {
    private final DiagnosisMapper diagnosisMapper;
    private final DiagnosisRepository diagnosisRepository;
    private final ParcelRepository parcelRepository;
-+  private final DiagnosisPersistence diagnosisPersistence;
++  private final DiagnosisService self;
    private final Path uploadDirectory;
  
    public DiagnosisService(
-@@ -46,15 +50,22 @@ public class DiagnosisService {
+@@ -46,15 +51,23 @@ public class DiagnosisService {
        DiagnosisMapper diagnosisMapper,
        DiagnosisRepository diagnosisRepository,
        ParcelRepository parcelRepository,
-+      DiagnosisPersistence diagnosisPersistence,
++      @Lazy DiagnosisService self,
        @Value("${app.upload-dir}") Path uploadDirectory) {
      this.aiServiceClient = aiServiceClient;
      this.diagnosisMapper = diagnosisMapper;
      this.diagnosisRepository = diagnosisRepository;
      this.parcelRepository = parcelRepository;
-+    this.diagnosisPersistence = diagnosisPersistence;
++    this.self = self;
      this.uploadDirectory = uploadDirectory;
    }
  
@@ -98,13 +47,14 @@ index d76d2a0..5db0bb0 100644
 +  /**
 +   * Creates a diagnosis. This method is intentionally not transactional: the parcel is loaded in a
 +   * short read-only transaction, then the AI service is called and the photo is written to disk
-+   * while no transaction is open, and finally the diagnosis is saved in its own transaction. This
-+   * keeps the slow AI network call from holding a database connection and transaction open.
++   * while no transaction is open, and finally the diagnosis is saved in its own transaction. The
++   * transactional steps are invoked through {@code self} so Spring's transaction proxy applies.
++   * This keeps the slow AI network call from holding a database connection and transaction open.
 +   */
    public DiagnosisResponse createDiagnosis(UUID ownerId, MultipartFile image, UUID parcelId) {
      if (image == null || parcelId == null) {
        throw new InvalidDiagnosisUploadException("Both image and parcelId are required.");
-@@ -65,12 +76,23 @@ public class DiagnosisService {
+@@ -65,12 +78,23 @@ public class DiagnosisService {
      }
  
      byte[] imageBytes = readAndValidateImage(image);
@@ -115,7 +65,7 @@ index d76d2a0..5db0bb0 100644
  
 -    PredictionResponse prediction = aiServiceClient.predict(image, parcel.getCrop());
 +    // Transaction 1 (read-only): load and ownership-check the parcel, then commit.
-+    Parcel parcel = diagnosisPersistence.loadOwnedParcel(parcelId, ownerId);
++    Parcel parcel = self.loadOwnedParcel(parcelId, ownerId);
 +    String crop = parcel.getCrop();
 +
 +    // No transaction open: call the AI service and write the photo to disk.
@@ -133,7 +83,7 @@ index d76d2a0..5db0bb0 100644
      DiagnosisResult result = toDiagnosisResult(prediction);
  
      String extension = hasPngSignature(imageBytes) ? ".png" : ".jpg";
-@@ -90,8 +112,16 @@ public class DiagnosisService {
+@@ -90,8 +114,16 @@ public class DiagnosisService {
              result,
              prediction.modelVersion(),
              Instant.now());
@@ -141,7 +91,7 @@ index d76d2a0..5db0bb0 100644
 +    // Transaction 2: persist the finished diagnosis.
      try {
 -      return diagnosisMapper.toResponse(diagnosisRepository.save(diagnosis));
-+      DiagnosisResponse response = diagnosisPersistence.save(diagnosis);
++      DiagnosisResponse response = self.saveDiagnosis(diagnosis);
 +      LOGGER.info(
 +          "Saved diagnosis {} for parcel {} with status {}",
 +          response.id(),
@@ -151,12 +101,39 @@ index d76d2a0..5db0bb0 100644
      } catch (RuntimeException exception) {
        try {
          Files.deleteIfExists(photoPath);
+@@ -102,6 +134,26 @@ public class DiagnosisService {
+     }
+   }
+ 
++  /**
++   * Loads an owned parcel in its own read-only transaction. Public and called through the {@code
++   * self} proxy so the transaction is applied; part of keeping the AI call outside a transaction.
++   */
++  @Transactional(readOnly = true)
++  public Parcel loadOwnedParcel(UUID parcelId, UUID ownerId) {
++    return parcelRepository
++        .findByIdAndOwnerId(parcelId, ownerId)
++        .orElseThrow(() -> new DiagnosisNotFoundException("The parcel was not found."));
++  }
++
++  /**
++   * Persists a finished diagnosis in its own transaction, after the AI call has returned. Public
++   * and called through the {@code self} proxy so the transaction is applied.
++   */
++  @Transactional
++  public DiagnosisResponse saveDiagnosis(Diagnosis diagnosis) {
++    return diagnosisMapper.toResponse(diagnosisRepository.save(diagnosis));
++  }
++
+   @Transactional(readOnly = true)
+   public List<DiagnosisResponse> listDiagnoses(UUID ownerId, UUID parcelId) {
+     List<Diagnosis> diagnoses;
 diff --git a/backend/src/test/java/app/diagnosis/service/DiagnosisServiceTest.java b/backend/src/test/java/app/diagnosis/service/DiagnosisServiceTest.java
 new file mode 100644
-index 0000000..d554496
+index 0000000..16ce547
 --- /dev/null
 +++ b/backend/src/test/java/app/diagnosis/service/DiagnosisServiceTest.java
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,130 @@
 +package app.diagnosis.service;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
@@ -168,6 +145,7 @@ index 0000000..d554496
 +import app.aiclient.AiServiceClient;
 +import app.aiclient.Prediction;
 +import app.aiclient.PredictionResponse;
++import app.diagnosis.domain.Diagnosis;
 +import app.diagnosis.dto.DiagnosisResponse;
 +import app.diagnosis.dto.DiagnosisStatus;
 +import app.diagnosis.mapper.DiagnosisMapper;
@@ -179,6 +157,7 @@ index 0000000..d554496
 +import java.nio.file.Files;
 +import java.nio.file.Path;
 +import java.time.Instant;
++import java.util.Comparator;
 +import java.util.List;
 +import java.util.UUID;
 +import java.util.concurrent.atomic.AtomicBoolean;
@@ -189,18 +168,19 @@ index 0000000..d554496
 +
 +/**
 + * Unit tests for the diagnosis orchestration. They confirm the AI network call runs while no
-+ * database transaction is active (BE-11). The transactional database steps are represented by a
-+ * mocked {@link DiagnosisPersistence}, so no database or container is needed.
++ * database transaction is active (BE-11). The transactional sub-steps (loadOwnedParcel,
++ * saveDiagnosis) are invoked through a {@code self} proxy in production; here that proxy is a mock,
++ * so no database or container is needed.
 + */
 +class DiagnosisServiceTest {
 +
++  private static final Path UPLOAD_DIRECTORY = Path.of("target", "test-uploads-unit");
++
 +  private final AiServiceClient aiServiceClient = mock(AiServiceClient.class);
-+  private final DiagnosisPersistence diagnosisPersistence = mock(DiagnosisPersistence.class);
++  private final DiagnosisMapper diagnosisMapper = mock(DiagnosisMapper.class);
 +  private final DiagnosisRepository diagnosisRepository = mock(DiagnosisRepository.class);
 +  private final ParcelRepository parcelRepository = mock(ParcelRepository.class);
-+  private final DiagnosisMapper diagnosisMapper = mock(DiagnosisMapper.class);
-+
-+  private static final Path UPLOAD_DIRECTORY = Path.of("target", "test-uploads-unit");
++  private final DiagnosisService self = mock(DiagnosisService.class);
 +
 +  private final DiagnosisService diagnosisService =
 +      new DiagnosisService(
@@ -208,16 +188,14 @@ index 0000000..d554496
 +          diagnosisMapper,
 +          diagnosisRepository,
 +          parcelRepository,
-+          diagnosisPersistence,
++          self,
 +          UPLOAD_DIRECTORY);
 +
 +  @AfterEach
 +  void cleanUploadDirectory() throws IOException {
 +    if (Files.exists(UPLOAD_DIRECTORY)) {
 +      try (var files = Files.walk(UPLOAD_DIRECTORY)) {
-+        files
-+            .sorted(java.util.Comparator.reverseOrder())
-+            .forEach(DiagnosisServiceTest::deleteQuietly);
++        files.sorted(Comparator.reverseOrder()).forEach(DiagnosisServiceTest::deleteQuietly);
 +      }
 +    }
 +  }
@@ -242,7 +220,7 @@ index 0000000..d554496
 +            "potato",
 +            null,
 +            Instant.now());
-+    when(diagnosisPersistence.loadOwnedParcel(parcelId, ownerId)).thenReturn(parcel);
++    when(self.loadOwnedParcel(parcelId, ownerId)).thenReturn(parcel);
 +
 +    AtomicBoolean transactionActiveDuringAiCall = new AtomicBoolean(true);
 +    when(aiServiceClient.predict(any(), eq("potato")))
@@ -258,7 +236,7 @@ index 0000000..d554496
 +                  "lab_only",
 +                  "plant-v1");
 +            });
-+    when(diagnosisPersistence.save(any()))
++    when(self.saveDiagnosis(any(Diagnosis.class)))
 +        .thenReturn(
 +            new DiagnosisResponse(
 +                UUID.randomUUID(),
